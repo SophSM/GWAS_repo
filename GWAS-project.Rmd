@@ -1,0 +1,617 @@
+---
+title: "GWAS project"
+author: "Sofia Salazar"
+date: "2022-11-14"
+output: html_document
+---
+# Libraries
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r}
+library(tidyverse)
+library(snpStats)
+library(SNPRelate)
+library(doParallel)
+library(RCurl)
+library(gdsfmt)
+```
+
+
+## Data structure
+
+We have data on n = 1401 individuals with genotype information across 861,473 single-nucleotide polymorphisms (SNPs). Corresponding clinical data, including age, sex and AREDS simplified Scale metric are available as well.
+
+Trait of interest: AREDS Simplified Scale
+The scoring system developed for patients assigns to each eye 1 risk factor for the presence of 1 or more large (≥125 μm, width of a large vein at disc margin) drusen and 1 risk factor for the presence of any pigment abnormality. Risk factors are summed across both eyes, yielding a 5-step scale (0-4) on which the approximate 5-year risk of developing advanced AMD in at least one eye increases in this easily remembered sequence: 0 factors, 0.5%; 1 factor, 3%; 2 factors, 12%; 3 factors, 25%; and 4 factors, 50%. For persons with no large drusen, presence of intermediate drusen in both eyes is counted as 1 risk factor.
+
+https://jamanetwork.com/journals/jamaophthalmology/fullarticle/417355
+
+## Reading in the data
+
+```{r}
+bedFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.bed"
+bimFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.bim"
+famFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.fam"
+data <- read.plink(bedFile,bimFile,famFile)
+```
+
+
+**Clinical data**
+
+Information about the age, sex and AREDS for each individual. These are additional covariates for each individual and other “outcome variables”
+
+```{r}
+clinical <- read_csv("/Users/sofiasalazar/Desktop/STATISTICS/Clinical_AgeRelatedMacularDegeneration.csv")
+```
+
+**SNP information**
+
+This file has information about each SNP, the "allele 1” is also referred to as the “minor allele” and “allele 2” refers to the “major allele” at each SNP. RS numbers and positions are from build Hg19.
+
+```{r}
+genoMap <- data$map
+colnames(genoMap)<-c("chr", "SNP", "gen.dist", "position", "A1", "A2")
+```
+
+**Genotype data**
+
+Contains every SNP in the study, as well as the genotype at that snp for each individual.
+
+```{r}
+genotype <- data$genotypes
+```
+
+**Participant information**
+
+Contains participant identification information, including a row for each individual and six columns, corresponding to “Family ID Number”, “Sample ID Number”,“Paternal ID Number”, “Maternal ID Number”, “Sex”, and “Phenotype”. 
+
+```{r}
+fam <- data$fam
+```
+
+## Quality Analysis
+
+### Call rate filtering
+
+For a given SNP, its call rate is defined as the proportion of inidividuals in our study for which the corresponding SNP information is not missing. We choose the SNPs that has percentage of missing observations below **our chosen threshold of 0.95**.
+
+```{r}
+snpsum.col <- col.summary(genotype)
+call <- 0.95
+keep <- with(snpsum.col, (!is.na(Call.rate) & Call.rate >= call))
+# 54583 SNPS were removed
+cat(ncol(genotype)-sum(keep),"SNPs will be removed due to low call rate.\n") # 54583
+genotype <- genotype[,keep]
+snpsum.col <- snpsum.col[keep,]
+```
+
+### Minor allele filtering
+
+Inadequate power to infer a statiscally significant relationship between the SNP and the trait under study is the result of a large degree of homogeneity at a given SNP across study participants. This occurs when we have a very small minor allele frequency (MAF), which means the majority of the individuals have two copies of the same major alleles. Here **we remove SNPs whose minor allele frequency is less than 1%.**
+
+```{r}
+minor <- 0.01 # threshold of 1%
+keep1 <- with(snpsum.col, (!is.na(MAF) & MAF > minor) )
+keep1[is.na(keep1)] <- FALSE
+cat(ncol(genotype)-sum(keep1),"SNPs will be removed due to low MAF .\n"  ) # 63395 SNPs removed
+genotype <- genotype[,keep1]  ## GENOTYPE DATA FILTERED
+snpsum.col <- snpsum.col[keep1,] 
+```
+
+## Sample level filtering
+
+removing individuals due to missing data, sample contamination, correlation (for population-based investigations), and racial/ethnic or gender ambiguity or discordance. In our study, we address these issues by filtering on call rate, heterozygosity, cryptic relatednes and duplicates using identity-by-descent, and we visually assess ancestry using PCA.
+
+```{r}
+snpsum.row <- row.summary(genotype)
+MAF <- snpsum.col$MAF
+callmatrix <- !is.na(genotype)
+
+hetExp <- callmatrix %*% (2*MAF*(1-MAF)) #%*% is the 'multiply_by_matrix' function from dplyr
+hetObs <- with(snpsum.row, Heterozygosity*(ncol(genotype))*Call.rate)
+snpsum.row$hetF <- 1-(hetObs/hetExp)
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/hetObsVSexp-3.png", width=800, height=800)
+  plot(hetObs,hetExp);abline(0,1)
+dev.off()
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/histHetF.png", width=800, height=800)
+  hist(snpsum.row$hetF)
+dev.off()
+head(snpsum.row)
+
+hetcutoff <- 0.055 
+
+sampleuse <- with(snpsum.row, abs(hetF) <= hetcutoff)
+sampleuse[is.na(sampleuse)] <- FALSE  
+cat(nrow(genotype)-sum(sampleuse), "individuals will be removed due to low sample call rate or unusual inbreeding coefficient.\n") # 4
+```
+
+
+exp Hets vs obs hets --> we see that mostly we have the same amount of observed hets as we expected
+
+we don't have large numbers of inbreeding coefficient |F| > 0.10
+
+
+```{r}
+genotype <- genotype[sampleuse,]
+id <- as.numeric(rownames(genotype))
+clinical <- filter(clinical, ID %in% id)
+snpsum.row<-row.summary(genotype)
+```
+
+### Hardy Weinberg
+
+taking "controls" as individuals without the risk factor or AREDS = 0
+
+```{r}
+hardy <- 10^-6
+# FIRST RUN A HARDY WEINBERG ON CONTROLS
+controls <- clinical[ clinical$AREDSSimplifiedScale==0, 'FamID' ]
+controls <- as.character(controls$FamID)
+snpsum.colControls <- col.summary(genotype[controls,])
+
+HWEuse <- with(snpsum.colControls, !is.na(z.HWE) & ( abs(z.HWE) < abs( qnorm(hardy/2) ) ) )
+
+rm(snpsum.colControls)
+
+HWEuse[is.na(HWEuse)] <- FALSE          
+
+cat(ncol(genotype)-sum(HWEuse),"SNPs will be removed due to high HWE.\n") #626
+
+genotype <- genotype[,HWEuse]
+
+print(genotype)
+```
+
+### Cryptic relateness, duplicates and gender identity
+
+We thus employ Identity-by-descent (IBD) analysis which is a common measurement of relateness and duplication.
+
+we set LD threshold to be 20% and kinship threshold to be 10%, which means that we would remove any SNPs whose relevant statistics are higher than our stated threshold values. Then we used snpgdsBED2GDS to create a GDS file of the data set from .bim, .bed and .fam files.
+
+ r^2 < 0.2 is the common practice for European populations. FIRST CONSIDERING THAT WE ALREADY DID MAF FILTERING https://www.biostars.org/p/450661/
+ 
+ 
+ kinship: Kinship coefficient φij is the probability that one allele sampled from individual i and one allele
+sampled from the same locus from individual j are IBD.
+
+third degree relative (0.044, 0.088), unrelated < 0.044 https://www.mv.helsinki.fi/home/mjxpirin/GWAS_course/material/GWAS5.pdf
+
+```{r}
+setwd("/Users/sofiasalazar/Desktop/STATISTICS/")
+ld.thresh <- 0.2 # linkage disequilibrium threshold
+kin.thresh <- 0.044 # kinship threshold
+snpgdsBED2GDS(bedFile, famFile, bimFile,"/Users/sofiasalazar/Desktop/STATISTICS/GWASproject_data.gds")
+
+genofile <- snpgdsOpen("/Users/sofiasalazar/Desktop/STATISTICS/GWASproject_data.gds", readonly = FALSE)
+gds.ids <- read.gdsn(index.gdsn(genofile, "sample.id"))
+gds.ids <- sub("-1", "", gds.ids)
+add.gdsn(genofile, "sample.id", gds.ids, replace = TRUE)
+
+set.seed(1000)
+geno.sample.ids <- rownames(genotype)
+snpSUB <- snpgdsLDpruning(genofile, ld.threshold = ld.thresh,
+
+                          sample.id = geno.sample.ids, 
+
+                          snp.id = colnames(genotype))  # filtering with LD
+
+snpset.ibd <- unlist(snpSUB, use.names=FALSE) # subset of snps that pass LD threshold
+
+cat(length(snpset.ibd),"will be used in IBD analysis\n") # 380930
+
+ibd <- snpgdsIBDMoM(genofile, kinship=TRUE, sample.id = geno.sample.ids, snp.id = snpset.ibd,  num.thread = 1)
+
+ibdcoeff <- snpgdsIBDSelection(ibd)    
+head(ibdcoeff)
+
+kins<-subset(ibdcoeff,ibdcoeff$kinship>0.044) #for context, the kinship coefficient for 1st cousins is 0.0625
+
+ibdcoeff <- ibdcoeff[ ibdcoeff$kinship >= kin.thresh, ]
+related.samples <- NULL
+
+while ( nrow(ibdcoeff) > 0 ) {
+    sample.counts <- arrange(plyr::count(c(ibdcoeff$ID1, ibdcoeff$ID2)), -freq)
+    rm.sample <- sample.counts[1, 'x']
+    cat("Removing sample", as.character(rm.sample), 'too closely related to', 
+    sample.counts[1, 'freq'],'other samples.\n')
+    ibdcoeff <- ibdcoeff[ibdcoeff$ID1 != rm.sample & ibdcoeff$ID2 != rm.sample,]
+    related.samples <- c(as.character(rm.sample), related.samples)
+}
+#Removing sample 11385 too closely related to 7 other samples.
+#Removing sample 10433 too closely related to 4 other samples.
+#Removing sample 10486 too closely related to 3 other samples.
+#Removing sample 10385 too closely related to 1 other samples.
+#Removing sample 10796 too closely related to 1 other samples.
+#Removing sample 11306 too closely related to 1 other samples.
+genotype <- genotype[ !(rownames(genotype) %in% related.samples), ]
+clinical <- clinical[ !(clinical$FamID %in% related.samples), ]
+
+geno.sample.ids <- rownames(genotype)
+
+cat(length(related.samples), "similar samples removed due to correlation coefficient >=", kin.thresh,"\n") # 6
+
+#print(genotype)
+
+genoBim<- genotype
+png("/Users/sofiasalazar/Desktop/STATISTICS/plot-ibd.png", width=800, height=800)
+  plot(kins$k0,kins$k1,xlim=c(0,1),ylim=c(0,1),xlab="IBD0",ylab="IBD1")
+dev.off()
+#plot(ibdcoeff$k0,ibdcoeff$k1,xlim=c(0,1),ylim=c(0,1),xlab="IBD0",ylab="IBD1") #this isALL PAIRS of individuals, mostly minimally related (unrelated)
+```
+
+### PCA
+
+snpgdsPCA - To calculate the eigenvectors and eigenvalues for principal component analysis in GWAS.
+
+```{r}
+pca <- snpgdsPCA(genofile, sample.id = geno.sample.ids,  snp.id = snpset.ibd, num.thread=2)
+
+pcs <- data.frame(FamID = pca$sample.id, pca$eigenvect[,1 : 10], stringsAsFactors = FALSE) # calculating the first 10 eigenvectors
+
+colnames(pcs)[2:11]<-paste("pc", 1:10, sep = "")
+
+head(pcs)
+
+pctab <- data.frame(sample.id = pca$sample.id,
+                    PC1 = pca$eigenvect[,1],    
+                    PC2 = pca$eigenvect[,2],
+                    PC3 = pca$eigenvect[,3],
+                    stringsAsFactors = FALSE)
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/PCA-12.png", width=800, height=800)
+  plot(pctab$PC2, pctab$PC1, xlab="Principal Component 2", ylab="Principal Component 1", main = "Ancestry Plot")
+dev.off()
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/PCA-13.png", width=800, height=800)
+  plot(pctab$PC3, pctab$PC1, xlab="Principal Component 3", ylab="Principal Component 1", main = "Ancestry Plot")
+dev.off()
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/PCA-23.png", width=800, height=800)
+  plot(pctab$PC3, pctab$PC2, xlab="Principal Component 3", ylab="Principal Component 2", main = "Ancestry Plot")
+dev.off()
+
+plot(pca$eigenval,ylab="Eigenvalue",xlab="Index of Eigenvector",xlim=c(1,20),pch=20,main="Scree plot") #since we did not calculate all PCs, just the first few, we can't calculate the proportion of variance captured by each PC, which is the eigenvalue / trace, where the trace is the sum of all eigenvalues. Instead, we simply plot the eigenvalue.
+```
+
+### Saving checkpoint
+
+```{r}
+closefn.gds(genofile)
+save(genotype, snpsum.col, snpsum.row, genofile, genoBim, clinical, pcs, file= "/Users/sofiasalazar/Desktop/STATISTICS/checkpoint1.RData")
+```
+
+## GWAS
+
+### Manipulating Phenotype Data
+
+phenoSub to be phenodata, which is created from merging the clinical and pcs data
+
+phenotype value (outcome variable) - using a normal rank-transformation of the hdl variable, which we show is necessary later on. 
+
+We want to remove variables that won’t be used in analysis, e.g. the remaining outcome variables and the untransformed version of HDL (or whatever trait is specified by traitName).
+
+### GWA 
+
+```{r}
+rm(list=ls()) # remove any data objects or functions to avoid collisions or misspecification
+load("/Users/sofiasalazar/Desktop/STATISTICS/checkpoint1.RData")
+genodata <- genotype
+
+#Print the number of SNPs to be checked
+cat(paste(ncol(genodata), " SNPs included in analysis.\n")) # 381396
+
+
+#create text file for GWAA output to be written to
+columns<-c("SNP", "Estimate", "Std.Error", "t-value", "p-value")
+
+#the output file handle is written in the mac style, with '~' referring to the current users home directory. 
+write.table(t(columns), "/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_3.txt", row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+```
+
+```{r}
+traitName<-'AREDSSimplifiedScale'
+```
+
+```{r}
+clinicalSub<-clinical[,c('FamID','sex','age',traitName)]
+clinicalSub<-dplyr::rename(clinicalSub,phenotype=traitName)
+# clinicalSub<-dplyr::rename(clinicalSub,prephenotype=traitName)
+# clinicalSub$phenotype <- rntransform(as.numeric(clinicalSub$prephenotype, family="gaussian"))
+# clinicalSub$prePhenotype <- NULL
+pcsSub<-pcs[,c('FamID','pc1','pc2')]
+
+# 
+phenodata <- merge(clinicalSub,pcsSub,by="FamID")  
+# phenodata <- merge(clinical,pcs,by="FamID") 
+# 
+phenodata<-phenodata[!is.na(phenodata$phenotype),]
+genodata <- genodata[as.character(phenodata$FamID),]
+
+cat(nrow(genodata), "samples included in analysis.\n") # 1391
+head(phenodata)
+
+# par(mfrow=c(1,2))
+values <- clinical[,c(traitName)]
+values <- values$AREDSSimplifiedScale
+hist(as.numeric(values), main=NULL, xlab=paste(traitName))
+```
+
+### The GWAA function
+
+```{r}
+GWAA <- function(genodata, phenodata, filename = NULL, append = FALSE, workers = getOption("mc.cores", 2L), flip = FALSE, select.snps = NULL, hosts = (detectCores()/2)) {
+    if (is.null(hosts)) {
+        cl <- makeCluster(workers)
+    } else {
+        cl <- makeCluster(hosts, "PSOCK")
+    }
+    show(cl)
+    registerDoParallel(cl)
+    # Function that will change which allele is counted (major or minor)
+    flip.matrix <- function(x) {
+        zero2 <- which(x == 0)
+        two0 <- which(x == 2)
+        x[zero2] <- 2
+        x[two0] <- 0
+        return(x)
+    }
+    foreach(part = 1:nSplits) %do% {
+        genoNum <- as(genodata[, snp.start[part]:snp.stop[part]], "numeric")
+        # flip.matrix function employed
+        if (isTRUE(flip)) 
+            genoNum <- flip.matrix(genoNum)
+        rsVec <- colnames(genoNum)
+        res <- foreach(snp.name = rsVec, .combine = "rbind") %dopar% {
+            result <- summary(glm(phenotype~age+snp+pc1+pc2, family = gaussian, data = cbind(phenodata, snp = genoNum[, snp.name]))) # without sex
+            result$coefficients["snp", ]
+        } 
+  write.table(cbind(rsVec, res), filename, append = TRUE, quote = FALSE, 
+
+        col.names = FALSE, row.names = FALSE)
+        cat(sprintf("GWAS SNPs %s-%s (%s%% finished)\n", snp.start[part], snp.stop[part], 
+         100 * part/nSplits))
+    }
+  stopCluster(cl)
+  return(print("Done."))
+} #end GWAA
+
+
+```
+
+## Running GWAS
+
+```{r}
+
+bedFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.bed"
+bimFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.bim"
+famFile<-"/Users/sofiasalazar/Desktop/STATISTICS/GWAS_data.fam"
+
+
+data <- read.plink(bedFile,bimFile,famFile)
+genoMap <-data$map
+colnames(genoMap)<-c("chr", "SNP", "gen.dist", "position", "A1", "A2")
+SNPs_sub <- genoMap$SNP[genoMap$chr<=22] #this took about 30 seconds on 4 2.3 GHz i9 cores to run the GWAA function
+
+genodata_sub <- genodata[,colnames(genodata)%in%SNPs_sub]
+
+nSNPs <- ncol(genodata_sub) # 381396
+nSplits <- 20
+genosplit <- ceiling(nSNPs/nSplits) # number of SNPs in each subset
+snp.start <- seq(1, nSNPs, genosplit) # index of first SNP in group
+snp.stop <- pmin(snp.start+genosplit-1, nSNPs) # index of last SNP in group
+
+start <- Sys.time()
+GWAA(genodata_sub, phenodata, filename="/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_3.txt")
+```
+
+
+```{r}
+gwa <- read.table("/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_3.txt", header = T)
+```
+
+### QQ plot
+
+```{r}
+png("/Users/sofiasalazar/Desktop/STATISTICS/QQ.png", width=800, height=800)
+  QQ_plot(gwa$p.value)
+dev.off()
+```
+
+A λ close to 1 reflects no evidence of inflation, while values up to 1.10 are generally considered acceptable for a GWAS. https://jbiomedsci.biomedcentral.com/articles/10.1186/s12929-021-00733-7
+
+
+### Manhattan plot
+
+```{r}
+
+new <- merge(gwa, genoMap, by = "SNP")
+
+df <- select(new, c("SNP", "chr", "position", "p.value"))
+
+snps <- nSNPs
+snplist <- colnames(genodata_sub)
+min.pval <- min(df$p.value)
+significant <- subset(df, p.value==min.pval)
+s.pos <- significant$position
+s.snp <- subset(genoMap, position==s.pos)$SNP
+
+
+annotateSNPRegions<-function(snps, chr, pos, pvalue, snplist,
+	kbaway=0, maxpvalue=1, labels=c(), col=c(), pch=c()) {
+
+	stopifnot(all(length(snps)==length(chr), length(chr)==length(pos),
+		length(pos)==length(pvalue)))
+	if (length(snplist)==0) stop("snplist vector is empty")
+
+	if(any(pos>1e6)) kbaway<-kbaway*1000
+
+	ann<-rep(0, length(snps))
+	for(i in seq_along(snplist)) {
+		si<-which(snps==snplist[i])
+		ci<-chr[si]
+		pi<-pos[si]
+		ann[chr==ci & pos >= pi-kbaway & pos <= pi+kbaway & pvalue<=maxpvalue]<-i
+	}
+	ann<-list(factor(ann, levels=0:length(snplist), labels=c("", snplist)))
+	if(length(col)>0 || length(pch)>0 || length(labels)>0) {
+		for(i in seq_along(snplist)) {
+			ann[[ snplist[i] ]] = list()
+			if(length(col)>0) { 
+				ann[[ snplist[i] ]]$col = col[ (i-1) %% length(col)+1 ]
+			}
+			if(length(pch)>0) {
+				ann[[ snplist[i] ]]$pch = pch[ (i-1) %% length(pch)+1 ]	
+			}
+                        if(length(labels)>0) {
+                                ann[[ snplist[i] ]]$label = labels[ (i-1) %% length(labels)+1 ]
+                        }
+		}
+	}
+	return(ann)
+}         
+
+
+ann<-annotateSNPRegions(df$SNP, df$chr,df$position,df$p.value, 
+	c(s.snp), 
+	labels=c("rs203687"),
+	col="limegreen",
+	kbaway=100
+)
+
+## significance level - bonferrioni correction
+sig.level <- 0.5 / nSNPs
+png("/Users/sofiasalazar/Desktop/STATISTICS/manhattan.png", width=800, height=800)
+  manhattan.plot(df$chr, df$position, df$p.value, annotate = ann, ann.default=list(label=list(offset=0)), sig.level=sig.level, points=list(pch =20))
+dev.off()
+
+##  with gene name
+ann<-annotateSNPRegions(df$SNP, df$chr,df$position,df$p.value, 
+	c(s.snp), 
+	labels=c("CFH"),
+	col="limegreen",
+	kbaway=100
+)
+
+## significance level - bonferrioni correction
+sig.level <- 0.5 / nSNPs
+png("/Users/sofiasalazar/Desktop/STATISTICS/manhattan-name.png", width=800, height=800)
+  manhattan.plot(df$chr, df$position, df$p.value, annotate = ann, ann.default=list(label=list(offset=0)), sig.level=sig.level, points=list(pch =20))
+dev.off()
+```
+
+## Fine mapping
+
+Including the significant SNP in the model
+
+```{r}
+write.table(t(columns), "/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_4.txt", row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+GWAA.with <- function(genodata, phenodata, filename = NULL, append = FALSE, workers = getOption("mc.cores", 2L), flip = FALSE, select.snps = NULL, hosts = (detectCores()/2)) {
+    if (is.null(hosts)) {
+        cl <- makeCluster(workers)
+    } else {
+        cl <- makeCluster(hosts, "PSOCK")
+    }
+    show(cl)
+    registerDoParallel(cl)
+    # Function that will change which allele is counted (major or minor)
+    flip.matrix <- function(x) {
+        zero2 <- which(x == 0)
+        two0 <- which(x == 2)
+        x[zero2] <- 2
+        x[two0] <- 0
+        return(x)
+    }
+    foreach(part = 1:nSplits) %do% {
+        genoNum <- as(genodata[, snp.start[part]:snp.stop[part]], "numeric")
+        # flip.matrix function employed
+        if (isTRUE(flip)) 
+            genoNum <- flip.matrix(genoNum)
+        rsVec <- colnames(genoNum)
+        res <- foreach(snp.name = rsVec, .combine = "rbind") %dopar% {
+            result <- summary(glm(phenotype~age+snp+pc1+pc2+as.numeric(genodata[,"rs203687"]), family = gaussian, data = cbind(phenodata, snp = genoNum[, snp.name]))) # every covariate minus FAMID
+            result$coefficients["snp", ]
+            # result <- summary(glm(phenotype ~ . - FamID, data = cbind(phenodata,
+                # snp = genoNum[, snp.name]))) # every covariate minus FAMID
+            # result$coefficients["snp", ]
+        } 
+  write.table(cbind(rsVec, res), filename, append = TRUE, quote = FALSE, 
+
+        col.names = FALSE, row.names = FALSE)
+        cat(sprintf("GWAS SNPs %s-%s (%s%% finished)\n", snp.start[part], snp.stop[part], 
+         100 * part/nSplits))
+    }
+  stopCluster(cl)
+  return(print("Done."))
+} #end GWAA
+
+start <- Sys.time()
+GWAA.with(genodata_sub, phenodata, filename="/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_4.txt")
+
+gwa <- read.table("/Users/sofiasalazar/Desktop/STATISTICS/GWAA_project_4.txt", header = T)
+```
+
+### QQ plot
+
+```{r}
+png("/Users/sofiasalazar/Desktop/STATISTICS/QQ-4.png", width=800, height=800)
+  QQ_plot(gwa$p.value)
+dev.off()
+```
+
+### Manhattan plots
+
+```{r}
+new <- merge(gwa, genoMap, by = "SNP")
+
+test <- select(new, c("SNP", "chr", "position", "p.value"))
+
+# getting second smallest p-value snp in fine mapping analysis
+ordered <- sort(test$p.value, decreasing = F) # minimum first
+p.val.2nd <- ordered[2]
+pos.2nd <-subset(test, p.value==p.val.2nd)$position
+snp.2nd <- subset(genoMap, position==pos.2nd)$SNP
+# getting smallest p-value snp from chromosome 2 in fine mapping analysis
+snps.chr2 <- subset(test, chr == 2)
+chr2.ordered <- sort(snps.chr2$p.value, decreasing = F)
+p.val.chr2 <- chr2.ordered[1]
+pos.chr2 <-subset(test, p.value==p.val.chr2)$position
+snp.chr2 <- subset(genoMap, position==pos.chr2)$SNP
+
+ann<-rep(1, length(test$p.value))
+ann[with(test, chr==1 & position==s.pos)]<-2
+ann[with(test, chr==1 & position==pos.2nd)]<-3
+ann[with(test, chr==2 & position==pos.chr2)]<-4
+ann<-factor(ann, levels=1:4, labels=c("",s.snp,snp.2nd, snp.chr2))
+
+## significance level
+sig.level <- 0.5 / nSNPs
+
+png("/Users/sofiasalazar/Desktop/STATISTICS/manhattan-4-ann.png", width=800, height=800)
+  manhattan.plot(test$chr, test$position, test$p.value, annotate = ann, ann.default=list(label=list(offset=0)), sig.level=sig.level, points=list(pch =20))
+dev.off()
+
+
+# With gene names
+
+ann<-rep(1, length(test$p.value))
+ann[with(test, chr==1 & position==s.pos)]<-2
+ann[with(test, chr==1 & position==pos.2nd)]<-3
+ann[with(test, chr==2 & position==pos.chr2)]<-4
+ann<-factor(ann, levels=1:4, labels=c("","CFH","PPP1R12B", "LINC01122"))
+sig.level <- 0.5 / nSNPs
+png("/Users/sofiasalazar/Desktop/STATISTICS/manhattan-4-genes.png", width=800, height=800)
+  manhattan.plot(test$chr, test$position, test$p.value, annotate = ann, ann.default=list(label=list(offset=0)), sig.level=sig.level, points=list(pch =20))
+dev.off()
+
+```
+
+
+
+
